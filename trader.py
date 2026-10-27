@@ -7,7 +7,7 @@ import os
 # 1. НАСТРОЙКИ
 # ==========================================
 BOT_TOKEN = '9202486628:AAHVyl1xmgCraqQLDISpruwNcXhHTGi7wug'
-CHAT_ID = 534358423  # <-- Твой Chat ID уже вставлен!
+CHAT_ID = 534358423
 
 SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'BNB/USDT', 'ADA/USDT', 'DOT/USDT', 'LINK/USDT', 'XRP/USDT', 'LTC/USDT']
 TIMEFRAME = '1d'
@@ -62,72 +62,74 @@ def send_msg(text):
         print(f"Ошибка Telegram: {e}")
 
 # ==========================================
-# 3. ОСНОВНАЯ ЛОГИКА
+# 3. ОСНОВНАЯ ЛОГИКА (как в бэктесте v34)
 # ==========================================
 def main():
-    print("🔄 Запуск проверки рынка...")
+    print("🔄 Проверка рынка по закрытым дневным свечам...")
     state = load_state()
     exchange = ccxt.binance({'enableRateLimit': True, 'timeout': 10000})
     
     for symbol in SYMBOLS:
         try:
-            ohlcv = exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=20)
-            closes = [c[4] for c in ohlcv]
-            current_price = closes[-1]
-            rsi = calculate_rsi(closes, RSI_PERIOD)
-            if rsi is None: continue
+            ohlcv = exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=40)
+            if len(ohlcv) < RSI_PERIOD + 2:
+                continue
             
-            # 1. Проверка активных сделок
-            deals_to_remove = []
+            prev = ohlcv[-2]  # последняя ЗАКРЫТАЯ дневная свеча
+            ts, o, h, l, c, v = prev
+            confirmed_closes = [x[4] for x in ohlcv[:-1]]
+            rsi = calculate_rsi(confirmed_closes, RSI_PERIOD)
+            if rsi is None:
+                continue
+            
+            # --- Управление открытой сделкой ---
             for idx, d in enumerate(state['active_deals']):
-                if d['symbol'] != symbol: continue
-                
-                # Take Profit
-                if current_price >= d['tp']:
+                if d['symbol'] != symbol:
+                    continue
+                # Тейк-профит (свеча достала до тейка)
+                if h >= d['tp']:
                     revenue = d['coins'] * d['tp']
                     profit = revenue - d['invested']
                     state['balance'] += revenue
                     state['total_trades'] += 1
                     state['total_profit'] += profit
-                    deals_to_remove.append(idx)
-                    send_msg(f"✅ *ЗАКРЫТА СДЕЛКА*\n\nМонета: `{symbol}`\nПрибыль: `${profit:.2f}`\nУсреднений: {d['level']}")
+                    state['active_deals'].pop(idx)
+                    send_msg(f"✅ *ЗАКРЫТА СДЕЛКА*\n\nМонета: `{symbol}`\nПрибыль: `${profit:.2f}`\nУсреднений было: {d['level']}")
                     continue
-                
-                # Safety Orders
+                # Усреднение
                 if d['level'] < MAX_SAFETY_ORDERS:
-                    next_so_price = d['base_price'] * (1 - ((d['level'] + 1) * SO_STEP_PERCENT))
-                    if current_price <= next_so_price:
+                    next_so = d['base_price'] * (1 - (d['level'] + 1) * SO_STEP_PERCENT)
+                    if l <= next_so:
                         so_size = BASE_ORDER_SIZE * (SO_MULTIPLIER ** (d['level'] + 1))
                         if state['balance'] >= so_size:
                             state['balance'] -= so_size
-                            coins_bought = so_size / current_price
                             d['invested'] += so_size
-                            d['coins'] += coins_bought
+                            d['coins'] += so_size / next_so
                             d['avg_price'] = d['invested'] / d['coins']
                             d['tp'] = d['avg_price'] * (1 + TAKE_PROFIT_PERCENT)
                             d['level'] += 1
-                            send_msg(f"📉 *УСРЕДНЕНИЕ*\n\nМонета: `{symbol}`\nНовая средняя: `${d['avg_price']:.2f}`\nУровень: {d['level']}")
+                            send_msg(f"📉 *УСРЕДНЕНИЕ*\n\nМонета: `{symbol}`\nНовая средняя: `${d['avg_price']:.2f}`\nУровень: {d['level']}/{MAX_SAFETY_ORDERS}")
             
-            for idx in reversed(deals_to_remove):
-                state['active_deals'].pop(idx)
-                
-            # 2. Проверка новых входов
+            # --- Новый вход ---
             active_symbols = [d['symbol'] for d in state['active_deals']]
-            if rsi < RSI_ENTRY_THRESHOLD and symbol not in active_symbols:
-                if state['balance'] >= BASE_ORDER_SIZE:
-                    state['balance'] -= BASE_ORDER_SIZE
-                    coins = BASE_ORDER_SIZE / current_price
-                    state['active_deals'].append({
-                        'symbol': symbol, 'base_price': current_price, 'avg_price': current_price,
-                        'tp': current_price * (1 + TAKE_PROFIT_PERCENT), 'invested': BASE_ORDER_SIZE,
-                        'coins': coins, 'level': 0
-                    })
-                    send_msg(f"🟢 *НОВАЯ СДЕЛКА*\n\nМонета: `{symbol}`\nЦена входа: `${current_price:.2f}`\nRSI: `{rsi:.1f}`\nТейк: `${current_price * (1 + TAKE_PROFIT_PERCENT):.2f}`")
-                    
+            if rsi < RSI_ENTRY_THRESHOLD and symbol not in active_symbols and state['balance'] >= BASE_ORDER_SIZE:
+                state['balance'] -= BASE_ORDER_SIZE
+                state['active_deals'].append({
+                    'symbol': symbol,
+                    'base_price': c,
+                    'avg_price': c,
+                    'tp': c * (1 + TAKE_PROFIT_PERCENT),
+                    'invested': BASE_ORDER_SIZE,
+                    'coins': BASE_ORDER_SIZE / c,
+                    'level': 0
+                })
+                send_msg(f"🟢 *НОВАЯ СДЕЛКА*\n\nМонета: `{symbol}`\nЦена входа: `${c:.2f}`\nRSI: `{rsi:.1f}`\nТейк: `${c * (1 + TAKE_PROFIT_PERCENT):.2f}`")
+                
         except Exception as e:
             print(f"Ошибка с {symbol}: {e}")
-            
+    
     save_state(state)
+    print(f"💰 Баланс: ${state['balance']:.2f} | Активных сделок: {len(state['active_deals'])}")
     print("✅ Проверка завершена.")
 
 if __name__ == '__main__':
